@@ -1,0 +1,11 @@
+{
+  "name": "makehaven/calendly_to_civicrm",
+  "type": "drupal-module",
+  "description": "Receives Calendly webhooks and creates CiviCRM Activities from bookings.",
+  "require": {},
+  "extra": {
+    "drupal": {
+      "version": "10.x"
+    }
+  }
+}

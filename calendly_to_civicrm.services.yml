@@ -1,0 +1,8 @@
+services:
+  calendly_to_civicrm.logger:
+    class: Drupal\Core\Logger\LoggerChannel
+    factory: ['@logger.factory', 'get']
+    arguments: ['calendly_to_civicrm']
+
+  calendly_to_civicrm.signature:
+    class: Drupal\calendly_to_civicrm\Service\CalendlySignature

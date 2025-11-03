@@ -1,0 +1,7 @@
+name: Calendly to CiviCRM
+type: module
+description: Receives Calendly webhooks and creates CiviCRM Activities (Tour, Orientation, etc).
+core_version_requirement: ^10 || ^11
+package: Integrations
+dependencies:
+  - drupal:system (>=10.0)

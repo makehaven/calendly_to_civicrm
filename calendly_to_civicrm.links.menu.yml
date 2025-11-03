@@ -1,0 +1,6 @@
+calendly_to_civicrm.settings:
+  title: 'Calendly → CiviCRM'
+  description: 'Configure the Calendly webhook and mapping rules.'
+  route_name: calendly_to_civicrm.settings
+  parent: system.admin_config_system
+  weight: 100

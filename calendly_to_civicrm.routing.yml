@@ -1,0 +1,15 @@
+calendly_to_civicrm.webhook:
+  path: '/calendly/webhook'
+  defaults:
+    _controller: '\Drupal\calendly_to_civicrm\Controller\WebhookController::receive'
+  requirements:
+    _access: 'TRUE'
+  methods: [POST]
+
+calendly_to_civicrm.settings:
+  path: '/admin/config/system/calendly-to-civicrm'
+  defaults:
+    _form: '\Drupal\calendly_to_civicrm\Form\SettingsForm'
+    _title: 'Calendly → CiviCRM'
+  requirements:
+    _permission: 'administer site configuration'
