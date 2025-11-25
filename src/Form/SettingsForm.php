@@ -135,13 +135,16 @@ staff2@makehaven.org: 456</pre>',
     $form['webhook_setup']['calendly_personal_access_token'] = [
       '#type' => 'password',
       '#title' => $this->t('Calendly personal access token'),
-      '#description' => $this->t('Paste a Personal Access Token generated from Calendly (Integrations & apps → API and webhooks). This token is not saved to configuration.'),
+      '#description' => $this->t('Paste a Personal Access Token generated from Calendly (Integrations & apps → API and webhooks). Paste only the token string (no "Bearer" prefix). This token is not saved to configuration.'),
+      '#maxlength' => 512,
     ];
     $form['webhook_setup']['register_webhook'] = [
       '#type' => 'submit',
       '#value' => $this->t('Register Webhook'),
       '#submit' => ['::registerWebhookSubmit'],
-      '#limit_validation_errors' => [['webhook_setup', 'calendly_personal_access_token'], ['shared_token']],
+      // The password element lives at the root level, so limit validation must
+      // reference its actual parents to ensure the value is preserved.
+      '#limit_validation_errors' => [['calendly_personal_access_token'], ['shared_token']],
       '#button_type' => 'secondary',
     ];
 
@@ -165,11 +168,16 @@ staff2@makehaven.org: 456</pre>',
    * Registers the webhook with Calendly using a personal access token.
    */
   public function registerWebhookSubmit(array &$form, FormStateInterface $form_state) {
-    $access_token = trim((string) $form_state->getValue('calendly_personal_access_token'));
+    $user_input = $form_state->getUserInput();
+    $access_token = trim((string) ($user_input['calendly_personal_access_token'] ?? $form_state->getValue('calendly_personal_access_token')));
+    if (str_starts_with(strtolower($access_token), 'bearer ')) {
+      $access_token = trim(substr($access_token, 7));
+    }
     if ($access_token === '') {
       $this->messenger()->addError($this->t('Enter a Calendly personal access token to register the webhook.'));
       return;
     }
+    $this->logTokenDiagnostics('Attempting Calendly profile fetch', $access_token);
 
     $shared_token_value = $form_state->getValue('shared_token');
     if ($shared_token_value === NULL) {
@@ -183,6 +191,7 @@ staff2@makehaven.org: 456</pre>',
       ]);
     }
     catch (RequestException $e) {
+      \Drupal::logger('calendly_to_civicrm')->warning('Calendly profile request failed: @error', ['@error' => $this->formatCalendlyError($e)]);
       $this->messenger()->addError($this->t('Unable to fetch Calendly profile: @error', ['@error' => $this->formatCalendlyError($e)]));
       return;
     }
@@ -208,6 +217,7 @@ staff2@makehaven.org: 456</pre>',
       ]);
     }
     catch (RequestException $e) {
+      \Drupal::logger('calendly_to_civicrm')->warning('Calendly webhook registration failed: @error', ['@error' => $this->formatCalendlyError($e)]);
       $this->messenger()->addError($this->t('Unable to register webhook with Calendly: @error', ['@error' => $this->formatCalendlyError($e)]));
       return;
     }
@@ -221,6 +231,21 @@ staff2@makehaven.org: 456</pre>',
 
     $form_state->setValue('calendly_personal_access_token', '');
     $form_state->setRebuild(TRUE);
+  }
+
+  /**
+   * Logs masked diagnostics for the provided Calendly token.
+   */
+  protected function logTokenDiagnostics(string $context, string $token): void {
+    $length = strlen($token);
+    $preview = $length > 8 ? substr($token, 0, 4) . '...' . substr($token, -4) : $token;
+    $hash = sha1($token);
+    \Drupal::logger('calendly_to_civicrm')->notice('@context (len=@len, preview=@preview, sha1=@hash)', [
+      '@context' => $context,
+      '@len' => $length,
+      '@preview' => $preview,
+      '@hash' => $hash,
+    ]);
   }
 
   /**
