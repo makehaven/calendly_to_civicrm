@@ -21,9 +21,12 @@ optionally linking the organizing staff member as the **source/assignee**.
    - Shared token and/or Webhook signing key.
    - Rules YAML (defaults provided).
    - Optional staff email→Civi contact ID map.
-4. In Calendly, add a webhook subscription to:
-   `https://YOUR-SITE/calendly/webhook?token=YOUR_TOKEN`
-   and subscribe to `invitee.created` (and `invitee.canceled` if desired).
+4. In Calendly, log in and open **Integrations & apps → API and webhooks**. Under
+   **Webhook subscriptions** click **Add webhook** and paste
+   `https://YOUR-SITE/calendly/webhook?token=YOUR_TOKEN` (omit the token if you
+   did not set one here). Subscribe to `invitee.created` (and
+   `invitee.canceled` if desired). After saving, view the webhook details on the
+   same page to copy the Webhook signing key if you plan to use it.
 
 ## Queue
 Run the worker manually if needed:
