@@ -9,6 +9,7 @@ use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
 use Drupal\Core\Queue\QueueWorkerBase;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Drupal\calendly_to_civicrm\EventParser;
+use Drupal\civicrm\Civicrm;
 
 /**
  * @QueueWorker(
@@ -25,12 +26,14 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
   protected $logger;
   protected ConfigFactoryInterface $configFactory;
   protected KeyValueStoreExpirableInterface $activityDedupeStore;
+  protected Civicrm $civicrm;
 
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory) {
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, Civicrm $civicrm) {
     parent::__construct($configuration, $plugin_id, $plugin_definition);
     $this->logger = $logger_factory->get('calendly_to_civicrm');
     $this->configFactory = $config_factory;
     $this->activityDedupeStore = $keyvalue_expirable_factory->get(self::ACTIVITY_DEDUPE_COLLECTION);
+    $this->civicrm = $civicrm;
   }
 
   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
@@ -40,7 +43,8 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       $plugin_definition,
       $container->get('logger.factory'),
       $container->get('config.factory'),
-      $container->get('keyvalue.expirable')
+      $container->get('keyvalue.expirable'),
+      $container->get('civicrm')
     );
   }
 
@@ -159,11 +163,13 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     return hash('sha256', $seed);
   }
 
-  protected static function civicrmBoot() {
-    if (!function_exists('civicrm_initialize')) {
-      throw new \RuntimeException('CiviCRM is not available in this Drupal runtime.');
+  protected function civicrmBoot() {
+    try {
+      $this->civicrm->initialize();
     }
-    civicrm_initialize();
+    catch (\Throwable $e) {
+      throw new \RuntimeException('Failed to initialize CiviCRM: ' . $e->getMessage(), 0, $e);
+    }
   }
 
   protected function civiFindContactByEmail(string $email): ?int {
