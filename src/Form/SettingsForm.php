@@ -4,8 +4,11 @@ namespace Drupal\calendly_to_civicrm\Form;
 
 use Drupal\Component\Utility\Html;
 use Drupal\Core\Config\ConfigFactoryInterface;
+use Drupal\Core\Config\TypedConfigManagerInterface;
 use Drupal\Core\Form\ConfigFormBase;
 use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Queue\QueueFactory;
+use Drupal\calendly_to_civicrm\Controller\WebhookController;
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\RequestException;
 use Symfony\Component\DependencyInjection\ContainerInterface;
@@ -16,16 +19,25 @@ class SettingsForm extends ConfigFormBase {
    * HTTP client for talking to Calendly.
    */
   protected ClientInterface $httpClient;
+  protected QueueFactory $queueFactory;
 
-  public function __construct(ConfigFactoryInterface $config_factory, ClientInterface $http_client) {
-    parent::__construct($config_factory);
+  public function __construct(
+    ConfigFactoryInterface $config_factory,
+    TypedConfigManagerInterface $typed_config_manager,
+    ClientInterface $http_client,
+    QueueFactory $queue_factory
+  ) {
+    parent::__construct($config_factory, $typed_config_manager);
     $this->httpClient = $http_client;
+    $this->queueFactory = $queue_factory;
   }
 
   public static function create(ContainerInterface $container) {
     return new static(
       $container->get('config.factory'),
-      $container->get('http_client')
+      $container->get('config.typed'),
+      $container->get('http_client'),
+      $container->get('queue')
     );
   }
 
@@ -147,6 +159,14 @@ staff2@makehaven.org: 456</pre>',
       '#limit_validation_errors' => [['calendly_personal_access_token'], ['shared_token']],
       '#button_type' => 'secondary',
     ];
+    $form['webhook_setup']['backfill_start_of_year'] = [
+      '#type' => 'submit',
+      '#value' => $this->t('Backfill From Start Of Year'),
+      '#submit' => ['::backfillStartOfYearSubmit'],
+      '#limit_validation_errors' => [['calendly_personal_access_token']],
+      '#button_type' => 'secondary',
+      '#description' => $this->t('Fetch invitees from Calendly starting January 1 of the current year and enqueue them for CiviCRM activity creation.'),
+    ];
 
     return parent::buildForm($form, $form_state);
   }
@@ -174,10 +194,12 @@ staff2@makehaven.org: 456</pre>',
       $access_token = trim(substr($access_token, 7));
     }
     if ($access_token === '') {
-      $this->messenger()->addError($this->t('Enter a Calendly personal access token to register the webhook.'));
+      $access_token = trim((string) $this->config('calendly_availability.settings')->get('personal_access_token'));
+    }
+    if ($access_token === '') {
+      $this->messenger()->addError($this->t('Enter a Calendly personal access token to register the webhook, or configure one in Calendly Availability settings.'));
       return;
     }
-    $this->logTokenDiagnostics('Attempting Calendly profile fetch', $access_token);
 
     $shared_token_value = $form_state->getValue('shared_token');
     if ($shared_token_value === NULL) {
@@ -234,18 +256,164 @@ staff2@makehaven.org: 456</pre>',
   }
 
   /**
-   * Logs masked diagnostics for the provided Calendly token.
+   * Backfills Calendly invitees from Jan 1 of the current year.
    */
-  protected function logTokenDiagnostics(string $context, string $token): void {
-    $length = strlen($token);
-    $preview = $length > 8 ? substr($token, 0, 4) . '...' . substr($token, -4) : $token;
-    $hash = sha1($token);
-    \Drupal::logger('calendly_to_civicrm')->notice('@context (len=@len, preview=@preview, sha1=@hash)', [
-      '@context' => $context,
-      '@len' => $length,
-      '@preview' => $preview,
-      '@hash' => $hash,
-    ]);
+  public function backfillStartOfYearSubmit(array &$form, FormStateInterface $form_state): void {
+    $access_token = $this->resolveCalendlyAccessToken($form_state);
+    if ($access_token === '') {
+      $this->messenger()->addError($this->t('Enter a Calendly personal access token, or configure one in Calendly Availability settings.'));
+      return;
+    }
+
+    try {
+      $user_response = $this->httpClient->request('GET', 'https://api.calendly.com/users/me', [
+        'headers' => $this->buildCalendlyHeaders($access_token),
+      ]);
+    }
+    catch (RequestException $e) {
+      $this->messenger()->addError($this->t('Unable to fetch Calendly profile: @error', ['@error' => $this->formatCalendlyError($e)]));
+      return;
+    }
+
+    $user_data = json_decode((string) $user_response->getBody(), TRUE);
+    $organization = $user_data['resource']['current_organization'] ?? NULL;
+    if (!$organization) {
+      $this->messenger()->addError($this->t('Calendly did not return an organization. Verify the personal access token and try again.'));
+      return;
+    }
+
+    $start_of_year = gmdate('Y-01-01\T00:00:00\Z');
+    $scheduled_events = $this->fetchCalendlyCollection(
+      'https://api.calendly.com/scheduled_events',
+      $access_token,
+      [
+        'organization' => $organization,
+        'min_start_time' => $start_of_year,
+        'sort' => 'start_time:asc',
+        'count' => 100,
+        'status' => 'active',
+      ]
+    );
+
+    $queue = $this->queueFactory->get(WebhookController::QUEUE);
+    $enqueued = 0;
+    $events_seen = 0;
+    foreach ($scheduled_events as $event_resource) {
+      $events_seen++;
+      $event_uri = (string) ($event_resource['uri'] ?? '');
+      if ($event_uri === '') {
+        continue;
+      }
+
+      $invitees = $this->fetchCalendlyCollection($event_uri . '/invitees', $access_token, [
+        'count' => 100,
+        'status' => 'active',
+      ]);
+
+      foreach ($invitees as $invitee_resource) {
+        $queue_item = $this->buildBackfillQueueItem($event_resource, $invitee_resource);
+        $queue->createItem($queue_item);
+        $enqueued++;
+      }
+    }
+
+    $this->messenger()->addStatus($this->t('Backfill queued @count invitees across @events scheduled events since @date.', [
+      '@count' => $enqueued,
+      '@events' => $events_seen,
+      '@date' => gmdate('Y-01-01'),
+    ]));
+    $form_state->setValue('calendly_personal_access_token', '');
+    $form_state->setRebuild(TRUE);
+  }
+
+  /**
+   * Resolves PAT from form input, then shared Calendly settings fallback.
+   */
+  protected function resolveCalendlyAccessToken(FormStateInterface $form_state): string {
+    $user_input = $form_state->getUserInput();
+    $access_token = trim((string) ($user_input['calendly_personal_access_token'] ?? $form_state->getValue('calendly_personal_access_token')));
+    if (str_starts_with(strtolower($access_token), 'bearer ')) {
+      $access_token = trim(substr($access_token, 7));
+    }
+    if ($access_token === '') {
+      $access_token = trim((string) $this->config('calendly_availability.settings')->get('personal_access_token'));
+    }
+    return $access_token;
+  }
+
+  /**
+   * Fetches all pages from a Calendly collection endpoint.
+   */
+  protected function fetchCalendlyCollection(string $endpoint, string $access_token, array $query = []): array {
+    $resources = [];
+    $next_url = $endpoint;
+    $next_query = $query;
+
+    while (!empty($next_url)) {
+      try {
+        $response = $this->httpClient->request('GET', $next_url, [
+          'headers' => $this->buildCalendlyHeaders($access_token),
+          'query' => $next_query,
+        ]);
+      }
+      catch (RequestException $e) {
+        \Drupal::logger('calendly_to_civicrm')->warning('Calendly collection fetch failed: @error', ['@error' => $this->formatCalendlyError($e)]);
+        break;
+      }
+
+      $decoded = json_decode((string) $response->getBody(), TRUE);
+      $batch = $decoded['collection'] ?? [];
+      if (is_array($batch)) {
+        $resources = array_merge($resources, $batch);
+      }
+
+      $pagination = $decoded['pagination'] ?? [];
+      $next_page = $pagination['next_page'] ?? NULL;
+      if (!is_string($next_page) || $next_page === '') {
+        break;
+      }
+      $next_url = $next_page;
+      $next_query = [];
+    }
+
+    return $resources;
+  }
+
+  /**
+   * Builds a queue item compatible with existing worker processing.
+   */
+  protected function buildBackfillQueueItem(array $event_resource, array $invitee_resource): array {
+    $event_uri = (string) ($event_resource['uri'] ?? '');
+    $invitee_uri = (string) ($invitee_resource['uri'] ?? '');
+    $created_at = (string) ($invitee_resource['created_at'] ?? $event_resource['created_at'] ?? gmdate('c'));
+    $dedupe_fingerprint = $event_uri . '|' . $invitee_uri . '|invitee.created|' . $created_at;
+    $dedupe_key = hash('sha256', $dedupe_fingerprint);
+
+    $event = [
+      'title' => (string) ($event_resource['name'] ?? 'Calendly Event'),
+      'invitee_email' => $invitee_resource['email'] ?? NULL,
+      'invitee_name' => $invitee_resource['name'] ?? NULL,
+      'organizer_email' => $event_resource['event_memberships'][0]['user_email'] ?? NULL,
+      'start' => $event_resource['start_time'] ?? NULL,
+      'end' => $event_resource['end_time'] ?? NULL,
+    ];
+
+    $payload = [
+      'event' => 'invitee.created',
+      'created_at' => $created_at,
+      'payload' => [
+        'event' => $event_uri,
+        'invitee' => $invitee_uri,
+      ],
+    ];
+
+    return [
+      'payload' => $payload,
+      'event' => $event,
+      'received' => time(),
+      'dedupe_key' => $dedupe_key,
+      'backfill' => TRUE,
+    ];
   }
 
   /**

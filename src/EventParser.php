@@ -2,8 +2,6 @@
 
 namespace Drupal\calendly_to_civicrm;
 
-use Drupal\Component\Utility\Unicode;
-
 /**
  * Extracts useful fields from a Calendly webhook payload and classifies activity.
  */
@@ -41,7 +39,7 @@ class EventParser {
       if (!is_string($val)) {
         continue;
       }
-      if ($match !== '' && Unicode::strpos(Unicode::strtolower($val), Unicode::strtolower($match)) !== FALSE) {
+      if ($match !== '' && stripos($val, $match) !== FALSE) {
         return $type;
       }
     }

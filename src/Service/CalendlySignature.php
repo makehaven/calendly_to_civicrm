@@ -10,7 +10,21 @@ namespace Drupal\calendly_to_civicrm\Service;
  */
 class CalendlySignature {
 
-  public function validate(string $signingKey, string $header, string $rawBody): bool {
+  /**
+   * Verifies HMAC and timestamp freshness.
+   *
+   * @param string $signingKey
+   *   Webhook signing key.
+   * @param string $header
+   *   Raw Calendly signature header.
+   * @param string $rawBody
+   *   Raw request body.
+   * @param int|null $now
+   *   Current Unix timestamp override (for tests).
+   * @param int $tolerance
+   *   Allowed clock skew in seconds.
+   */
+  public function validate(string $signingKey, string $header, string $rawBody, ?int $now = NULL, int $tolerance = 300): bool {
     if (empty($signingKey) || empty($header)) {
       return FALSE;
     }
@@ -22,6 +36,14 @@ class CalendlySignature {
       }
     }
     if (empty($parts['t']) || empty($parts['v1'])) {
+      return FALSE;
+    }
+    if (!is_numeric($parts['t'])) {
+      return FALSE;
+    }
+    $timestamp = (int) $parts['t'];
+    $current_time = $now ?? time();
+    if (abs($current_time - $timestamp) > $tolerance) {
       return FALSE;
     }
     $signedPayload = $parts['t'] . '.' . $rawBody;

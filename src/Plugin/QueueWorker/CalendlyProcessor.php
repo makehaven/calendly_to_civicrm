@@ -2,6 +2,9 @@
 
 namespace Drupal\calendly_to_civicrm\Plugin\QueueWorker;
 
+use Drupal\Core\Config\ConfigFactoryInterface;
+use Drupal\Core\KeyValueStore\KeyValueExpirableFactoryInterface;
+use Drupal\Core\KeyValueStore\KeyValueStoreExpirableInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
 use Drupal\Core\Queue\QueueWorkerBase;
 use Symfony\Component\DependencyInjection\ContainerInterface;
@@ -16,11 +19,18 @@ use Drupal\calendly_to_civicrm\EventParser;
  */
 class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPluginInterface {
 
-  protected $logger;
+  const ACTIVITY_DEDUPE_COLLECTION = 'calendly_to_civicrm.activity_dedupe';
+  const ACTIVITY_DEDUPE_TTL = 2592000;
 
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory) {
+  protected $logger;
+  protected ConfigFactoryInterface $configFactory;
+  protected KeyValueStoreExpirableInterface $activityDedupeStore;
+
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory) {
     parent::__construct($configuration, $plugin_id, $plugin_definition);
     $this->logger = $logger_factory->get('calendly_to_civicrm');
+    $this->configFactory = $config_factory;
+    $this->activityDedupeStore = $keyvalue_expirable_factory->get(self::ACTIVITY_DEDUPE_COLLECTION);
   }
 
   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
@@ -28,12 +38,14 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       $configuration,
       $plugin_id,
       $plugin_definition,
-      $container->get('logger.factory')
+      $container->get('logger.factory'),
+      $container->get('config.factory'),
+      $container->get('keyvalue.expirable')
     );
   }
 
   public function processItem($data) {
-    $config = \Drupal::config('calendly_to_civicrm.settings');
+    $config = $this->configFactory->get('calendly_to_civicrm.settings');
     $rulesYaml = (string) $config->get('rules_yaml');
     $defaultActivityType = (string) ($config->get('default_activity_type') ?? 'Meeting');
     $preferConfigMap = (bool) $config->get('prefer_config_map');
@@ -83,7 +95,7 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     }
 
     try {
-      $inviteeId = self::civiFindOrCreateContact($inviteeEmail, $inviteeName);
+      $inviteeId = $this->civiFindOrCreateContact($inviteeEmail, $inviteeName);
     }
     catch (\Throwable $e) {
       $this->logger->error('Civi error creating invitee: @m', ['@m' => $e->getMessage()]);
@@ -96,12 +108,18 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
         $staffId = (int) $staffMap[$organizerEmail];
       }
       if (!$staffId) {
-        $staffId = self::civiFindContactByEmail($organizerEmail);
+        $staffId = $this->civiFindContactByEmail($organizerEmail);
       }
     }
 
+    $activityDedupeKey = $this->buildActivityDedupeKey($data, $event, $activityType, (string) $inviteeEmail, (string) $start, (string) $title);
+    if (!$this->activityDedupeStore->setWithExpireIfNotExists($activityDedupeKey, time(), self::ACTIVITY_DEDUPE_TTL)) {
+      $this->logger->notice('Skipping duplicate Calendly activity for dedupe key @key.', ['@key' => $activityDedupeKey]);
+      return;
+    }
+
     try {
-      self::civiCreateActivity([
+      $this->civiCreateActivity([
         'activity_type_id' => $activityType,
         'source_contact_id' => $staffId ?: NULL,
         'assignee_contact_id' => $staffId ?: NULL,
@@ -112,9 +130,33 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       $this->logger->notice('Created activity "@type" for invitee @email.', ['@type' => $activityType, '@email' => $inviteeEmail]);
     }
     catch (\Throwable $e) {
+      $this->activityDedupeStore->delete($activityDedupeKey);
       $this->logger->error('Failed to create activity: @m', ['@m' => $e->getMessage()]);
       throw $e;
     }
+  }
+
+  /**
+   * Builds an idempotency key for activity creation.
+   */
+  protected function buildActivityDedupeKey(array $data, array $event, string $activityType, string $inviteeEmail, string $start, string $title): string {
+    $payload = $data['payload'] ?? [];
+    $event_uri = (string) ($payload['payload']['event'] ?? $payload['event'] ?? '');
+    $invitee_uri = (string) ($payload['payload']['invitee'] ?? $payload['invitee'] ?? '');
+    $controller_key = (string) ($data['dedupe_key'] ?? '');
+
+    $seed = implode('|', [
+      $controller_key,
+      $event_uri,
+      $invitee_uri,
+      strtolower($inviteeEmail),
+      $start,
+      strtolower($title),
+      $activityType,
+      (string) ($event['end'] ?? ''),
+    ]);
+
+    return hash('sha256', $seed);
   }
 
   protected static function civicrmBoot() {
@@ -124,8 +166,8 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     civicrm_initialize();
   }
 
-  protected static function civiFindContactByEmail(string $email): ?int {
-    self::civicrmBoot();
+  protected function civiFindContactByEmail(string $email): ?int {
+    $this->civicrmBoot();
     try {
       $r = civicrm_api3('Contact', 'get', [
         'sequential' => 1,
@@ -142,8 +184,8 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     return NULL;
   }
 
-  protected static function civiFindOrCreateContact(string $email, ?string $displayName): int {
-    $existing = self::civiFindContactByEmail($email);
+  protected function civiFindOrCreateContact(string $email, ?string $displayName): int {
+    $existing = $this->civiFindContactByEmail($email);
     if ($existing) {
       return $existing;
     }
@@ -158,8 +200,8 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     return (int) $r['id'];
   }
 
-  protected static function civiCreateActivity(array $params): int {
-    self::civicrmBoot();
+  protected function civiCreateActivity(array $params): int {
+    $this->civicrmBoot();
     $r = civicrm_api3('Activity', 'create', $params);
     return (int) $r['id'];
   }
