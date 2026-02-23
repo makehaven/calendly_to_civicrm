@@ -161,11 +161,11 @@ staff2@makehaven.org: 456</pre>',
     ];
     $form['webhook_setup']['backfill_start_of_year'] = [
       '#type' => 'submit',
-      '#value' => $this->t('Backfill From Start Of Year'),
+      '#value' => $this->t('Backfill Last 12 Months'),
       '#submit' => ['::backfillStartOfYearSubmit'],
       '#limit_validation_errors' => [['calendly_personal_access_token']],
       '#button_type' => 'secondary',
-      '#description' => $this->t('Fetch invitees from Calendly starting January 1 of the current year and enqueue them for CiviCRM activity creation.'),
+      '#description' => $this->t('Fetch invitees from Calendly for the last 12 months and enqueue them for CiviCRM activity creation.'),
     ];
 
     return parent::buildForm($form, $form_state);
@@ -282,13 +282,14 @@ staff2@makehaven.org: 456</pre>',
       return;
     }
 
-    $start_of_year = gmdate('Y-01-01\T00:00:00\Z');
+    $start_date_ts = strtotime('-12 months');
+    $start_date_iso = gmdate('Y-01-01\T00:00:00\Z', $start_date_ts);
     $scheduled_events = $this->fetchCalendlyCollection(
       'https://api.calendly.com/scheduled_events',
       $access_token,
       [
         'organization' => $organization,
-        'min_start_time' => $start_of_year,
+        'min_start_time' => $start_date_iso,
         'sort' => 'start_time:asc',
         'count' => 100,
         'status' => 'active',
@@ -320,7 +321,7 @@ staff2@makehaven.org: 456</pre>',
     $this->messenger()->addStatus($this->t('Backfill queued @count invitees across @events scheduled events since @date.', [
       '@count' => $enqueued,
       '@events' => $events_seen,
-      '@date' => gmdate('Y-01-01'),
+      '@date' => gmdate('Y-m-d', $start_date_ts),
     ]));
     $form_state->setValue('calendly_personal_access_token', '');
     $form_state->setRebuild(TRUE);

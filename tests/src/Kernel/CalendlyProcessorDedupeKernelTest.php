@@ -7,6 +7,7 @@ use Drupal\Core\KeyValueStore\KeyValueExpirableFactoryInterface;
 use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Drupal\KernelTests\KernelTestBase;
 use Drupal\calendly_to_civicrm\Plugin\QueueWorker\CalendlyProcessor;
+use Drupal\civicrm\Civicrm;
 
 /**
  * Verifies queue worker idempotency behavior with real Drupal services.
@@ -28,6 +29,7 @@ class CalendlyProcessorDedupeKernelTest extends KernelTestBase {
     $logger_factory = $this->container->get('logger.factory');
     $config_factory = $this->container->get('config.factory');
     $keyvalue_expirable = $this->container->get('keyvalue.expirable');
+    $civicrm = $this->container->get('civicrm');
 
     $worker = new TestCalendlyProcessor(
       [],
@@ -35,7 +37,8 @@ class CalendlyProcessorDedupeKernelTest extends KernelTestBase {
       [],
       $logger_factory,
       $config_factory,
-      $keyvalue_expirable
+      $keyvalue_expirable,
+      $civicrm
     );
 
     $data = [
@@ -71,11 +74,11 @@ class TestCalendlyProcessor extends CalendlyProcessor {
 
   public int $createdActivities = 0;
 
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, LoggerChannelFactoryInterface $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory) {
-    parent::__construct($configuration, $plugin_id, $plugin_definition, $logger_factory, $config_factory, $keyvalue_expirable_factory);
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, LoggerChannelFactoryInterface $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, Civicrm $civicrm) {
+    parent::__construct($configuration, $plugin_id, $plugin_definition, $logger_factory, $config_factory, $keyvalue_expirable_factory, $civicrm);
   }
 
-  protected static function civicrmBoot() {}
+  protected function civicrmBoot() {}
 
   protected function civiFindContactByEmail(string $email): ?int {
     return NULL;

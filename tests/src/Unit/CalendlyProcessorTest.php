@@ -10,6 +10,7 @@ use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Drupal\Core\Logger\LoggerChannelInterface;
 use Drupal\Tests\UnitTestCase;
 use Drupal\calendly_to_civicrm\Plugin\QueueWorker\CalendlyProcessor;
+use Drupal\civicrm\Civicrm;
 
 /**
  * @coversDefaultClass \Drupal\calendly_to_civicrm\Plugin\QueueWorker\CalendlyProcessor
@@ -82,7 +83,9 @@ class CalendlyProcessorTest extends UnitTestCase {
       ->with(CalendlyProcessor::ACTIVITY_DEDUPE_COLLECTION)
       ->willReturn($store);
 
-    return new TestableCalendlyProcessor([], 'calendly_to_civicrm.queue', [], $logger_factory, $config_factory, $keyvalue_factory, $throw_on_create);
+    $civicrm = $this->createMock(Civicrm::class);
+
+    return new TestableCalendlyProcessor([], 'calendly_to_civicrm.queue', [], $logger_factory, $config_factory, $keyvalue_factory, $civicrm, $throw_on_create);
   }
 
   /**
@@ -118,12 +121,12 @@ class TestableCalendlyProcessor extends CalendlyProcessor {
   public int $createdActivities = 0;
   private bool $throwOnCreate;
 
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, bool $throw_on_create) {
-    parent::__construct($configuration, $plugin_id, $plugin_definition, $logger_factory, $config_factory, $keyvalue_expirable_factory);
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, Civicrm $civicrm, bool $throw_on_create) {
+    parent::__construct($configuration, $plugin_id, $plugin_definition, $logger_factory, $config_factory, $keyvalue_expirable_factory, $civicrm);
     $this->throwOnCreate = $throw_on_create;
   }
 
-  protected static function civicrmBoot() {}
+  protected function civicrmBoot() {}
 
   protected function civiFindContactByEmail(string $email): ?int {
     return 101;
@@ -142,4 +145,3 @@ class TestableCalendlyProcessor extends CalendlyProcessor {
   }
 
 }
-
