@@ -159,13 +159,23 @@ staff2@makehaven.org: 456</pre>',
       '#limit_validation_errors' => [['calendly_personal_access_token'], ['shared_token']],
       '#button_type' => 'secondary',
     ];
+    $form['webhook_setup']['backfill_since_date'] = [
+      '#type' => 'date',
+      '#title' => $this->t('Backfill since (UTC date)'),
+      '#default_value' => gmdate('Y-m-d', strtotime('-12 months')),
+      '#description' => $this->t('Use this to run a targeted historical backfill (for example: 2025-01-01 or 2024-01-01).'),
+    ];
+    $form['webhook_setup']['backfill_warning'] = [
+      '#type' => 'item',
+      '#markup' => $this->t('<p><strong>Warning:</strong> Running backfill from an older date can enqueue records already imported. The queue worker dedupes activity creation for about 30 days, but very old reruns can still create duplicates.</p>'),
+    ];
     $form['webhook_setup']['backfill_start_of_year'] = [
       '#type' => 'submit',
-      '#value' => $this->t('Backfill Last 12 Months'),
+      '#value' => $this->t('Backfill From Date'),
       '#submit' => ['::backfillStartOfYearSubmit'],
-      '#limit_validation_errors' => [['calendly_personal_access_token']],
+      '#limit_validation_errors' => [['calendly_personal_access_token'], ['backfill_since_date']],
       '#button_type' => 'secondary',
-      '#description' => $this->t('Fetch invitees from Calendly for the last 12 months and enqueue them for CiviCRM activity creation.'),
+      '#description' => $this->t('Fetch scheduled events and invitees from Calendly since the selected date and enqueue them for CiviCRM activity creation.'),
     ];
 
     return parent::buildForm($form, $form_state);
@@ -256,7 +266,7 @@ staff2@makehaven.org: 456</pre>',
   }
 
   /**
-   * Backfills Calendly invitees from Jan 1 of the current year.
+   * Backfills Calendly invitees starting at a selected date.
    */
   public function backfillStartOfYearSubmit(array &$form, FormStateInterface $form_state): void {
     $access_token = $this->resolveCalendlyAccessToken($form_state);
@@ -282,8 +292,25 @@ staff2@makehaven.org: 456</pre>',
       return;
     }
 
-    $start_date_ts = strtotime('-12 months');
-    $start_date_iso = gmdate('Y-01-01\T00:00:00\Z', $start_date_ts);
+    $start_date_input = trim((string) ($form_state->getValue('backfill_since_date') ?? ''));
+    if ($start_date_input === '') {
+      $start_date_input = gmdate('Y-m-d', strtotime('-12 months'));
+    }
+    $start_date = \DateTimeImmutable::createFromFormat('Y-m-d', $start_date_input, new \DateTimeZone('UTC'));
+    if (!$start_date || $start_date->format('Y-m-d') !== $start_date_input) {
+      $this->messenger()->addError($this->t('Enter a valid Backfill since date in YYYY-MM-DD format.'));
+      return;
+    }
+    $today_utc = new \DateTimeImmutable('today', new \DateTimeZone('UTC'));
+    if ($start_date > $today_utc) {
+      $this->messenger()->addError($this->t('Backfill since date cannot be in the future.'));
+      return;
+    }
+
+    $start_date_iso = $start_date->format('Y-m-d\T00:00:00\Z');
+    $start_date_display = $start_date->format('Y-m-d');
+    $scheduled_events_complete = TRUE;
+    $scheduled_events_error = '';
     $scheduled_events = $this->fetchCalendlyCollection(
       'https://api.calendly.com/scheduled_events',
       $access_token,
@@ -293,12 +320,16 @@ staff2@makehaven.org: 456</pre>',
         'sort' => 'start_time:asc',
         'count' => 100,
         'status' => 'active',
-      ]
+      ],
+      $scheduled_events_complete,
+      $scheduled_events_error,
     );
 
     $queue = $this->queueFactory->get(WebhookController::QUEUE);
     $enqueued = 0;
     $events_seen = 0;
+    $invitee_fetch_failures = 0;
+    $invitee_failure_examples = [];
     foreach ($scheduled_events as $event_resource) {
       $events_seen++;
       $event_uri = (string) ($event_resource['uri'] ?? '');
@@ -306,10 +337,18 @@ staff2@makehaven.org: 456</pre>',
         continue;
       }
 
+      $invitees_complete = TRUE;
+      $invitees_error = '';
       $invitees = $this->fetchCalendlyCollection($event_uri . '/invitees', $access_token, [
         'count' => 100,
         'status' => 'active',
-      ]);
+      ], $invitees_complete, $invitees_error);
+      if (!$invitees_complete) {
+        $invitee_fetch_failures++;
+        if ($invitees_error !== '' && count($invitee_failure_examples) < 3) {
+          $invitee_failure_examples[] = $invitees_error;
+        }
+      }
 
       foreach ($invitees as $invitee_resource) {
         $queue_item = $this->buildBackfillQueueItem($event_resource, $invitee_resource);
@@ -321,7 +360,31 @@ staff2@makehaven.org: 456</pre>',
     $this->messenger()->addStatus($this->t('Backfill queued @count invitees across @events scheduled events since @date.', [
       '@count' => $enqueued,
       '@events' => $events_seen,
-      '@date' => gmdate('Y-m-d', $start_date_ts),
+      '@date' => $start_date_display,
+    ]));
+
+    $partial = !$scheduled_events_complete || $invitee_fetch_failures > 0;
+    if ($partial) {
+      $details = [];
+      if (!$scheduled_events_complete && $scheduled_events_error !== '') {
+        $details[] = $this->t('Scheduled events fetch error: @error', ['@error' => $scheduled_events_error]);
+      }
+      if ($invitee_fetch_failures > 0) {
+        $details[] = $this->t('Invitee fetch failed for @count scheduled event(s).', ['@count' => $invitee_fetch_failures]);
+      }
+      if (!empty($invitee_failure_examples)) {
+        $details[] = $this->t('Sample invitee error(s): @errors', ['@errors' => implode(' | ', $invitee_failure_examples)]);
+      }
+      $this->messenger()->addWarning($this->t('Backfill was partial. Run Backfill From Date again with the same date to continue safely. @details', [
+        '@details' => implode(' ', $details),
+      ]));
+    }
+    else {
+      $this->messenger()->addStatus($this->t('Calendly fetch completed without API pagination errors.'));
+    }
+
+    $this->messenger()->addStatus($this->t('Queue now has @count item(s) pending processing.', [
+      '@count' => $queue->numberOfItems(),
     ]));
     $form_state->setValue('calendly_personal_access_token', '');
     $form_state->setRebuild(TRUE);
@@ -345,20 +408,28 @@ staff2@makehaven.org: 456</pre>',
   /**
    * Fetches all pages from a Calendly collection endpoint.
    */
-  protected function fetchCalendlyCollection(string $endpoint, string $access_token, array $query = []): array {
+  protected function fetchCalendlyCollection(string $endpoint, string $access_token, array $query = [], ?bool &$complete = NULL, ?string &$error_message = NULL): array {
     $resources = [];
     $next_url = $endpoint;
     $next_query = $query;
+    $base_query = $query;
+    $complete = TRUE;
+    $error_message = '';
 
     while (!empty($next_url)) {
       try {
-        $response = $this->httpClient->request('GET', $next_url, [
+        $request_options = [
           'headers' => $this->buildCalendlyHeaders($access_token),
-          'query' => $next_query,
-        ]);
+        ];
+        if (!empty($next_query)) {
+          $request_options['query'] = $next_query;
+        }
+        $response = $this->httpClient->request('GET', $next_url, $request_options);
       }
       catch (RequestException $e) {
-        \Drupal::logger('calendly_to_civicrm')->warning('Calendly collection fetch failed: @error', ['@error' => $this->formatCalendlyError($e)]);
+        $complete = FALSE;
+        $error_message = $this->formatCalendlyError($e);
+        \Drupal::logger('calendly_to_civicrm')->warning('Calendly collection fetch failed: @error', ['@error' => $error_message]);
         break;
       }
 
@@ -374,7 +445,33 @@ staff2@makehaven.org: 456</pre>',
         break;
       }
       $next_url = $next_page;
-      $next_query = [];
+      $next_query = $base_query;
+
+      $parts = parse_url($next_page);
+      if (is_array($parts) && isset($parts['query'])) {
+        parse_str($parts['query'], $page_query);
+        if (is_array($page_query)) {
+          $next_query = array_replace($base_query, $page_query);
+        }
+
+        $rebuilt_url = '';
+        if (!empty($parts['scheme'])) {
+          $rebuilt_url .= $parts['scheme'] . '://';
+        }
+        if (!empty($parts['host'])) {
+          $rebuilt_url .= $parts['host'];
+        }
+        if (!empty($parts['port'])) {
+          $rebuilt_url .= ':' . $parts['port'];
+        }
+        $rebuilt_url .= $parts['path'] ?? '';
+        if (!empty($parts['fragment'])) {
+          $rebuilt_url .= '#' . $parts['fragment'];
+        }
+        if ($rebuilt_url !== '') {
+          $next_url = $rebuilt_url;
+        }
+      }
     }
 
     return $resources;
