@@ -3,5 +3,6 @@ type: module
 description: Receives Calendly webhooks and creates CiviCRM Activities (Tour, Orientation, etc).
 core_version_requirement: ^10 || ^11
 package: Makerspace
+configure: calendly_to_civicrm.settings
 dependencies:
   - drupal:system (>=10.0)
