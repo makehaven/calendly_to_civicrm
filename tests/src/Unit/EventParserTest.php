@@ -43,6 +43,62 @@ class EventParserTest extends UnitTestCase {
   }
 
   /**
+   * Campaign tags are what make a flyer-sourced tour distinguishable.
+   *
+   * @covers ::parse
+   */
+  public function testParseExtractsTrackingAndAnswersFromFlatPayload(): void {
+    $payload = [
+      'email' => 'invitee@example.org',
+      'name' => 'Invitee Name',
+      'tracking' => [
+        'utm_campaign' => 'postcard',
+        'utm_source' => 'landing_page',
+        'utm_medium' => 'website',
+      ],
+      'questions_and_answers' => [
+        ['question' => 'How did you hear about us?', 'answer' => 'A flyer', 'position' => 0],
+      ],
+    ];
+
+    $parsed = EventParser::parse($payload);
+
+    $this->assertSame('postcard', $parsed['tracking']['utm_campaign']);
+    $this->assertSame('landing_page', $parsed['tracking']['utm_source']);
+    $this->assertSame('A flyer', $parsed['questions_and_answers'][0]['answer']);
+  }
+
+  /**
+   * @covers ::parse
+   */
+  public function testParseExtractsTrackingFromNestedInviteePayload(): void {
+    $payload = [
+      'payload' => [
+        'invitee' => [
+          'email' => 'invitee@example.org',
+          'tracking' => ['utm_campaign' => 'flyers-winter-hobby'],
+        ],
+      ],
+    ];
+
+    $parsed = EventParser::parse($payload);
+
+    $this->assertSame('flyers-winter-hobby', $parsed['tracking']['utm_campaign']);
+  }
+
+  /**
+   * An untagged walk-in booking must still parse cleanly.
+   *
+   * @covers ::parse
+   */
+  public function testParseDefaultsTrackingAndAnswersToEmptyArrays(): void {
+    $parsed = EventParser::parse(['email' => 'invitee@example.org']);
+
+    $this->assertSame([], $parsed['tracking']);
+    $this->assertSame([], $parsed['questions_and_answers']);
+  }
+
+  /**
    * @covers ::classifyActivity
    */
   public function testClassifyActivityUsesFirstCaseInsensitiveMatch(): void {

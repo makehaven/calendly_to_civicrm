@@ -25,6 +25,17 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
   const ACTIVITY_DEDUPE_COLLECTION = 'calendly_to_civicrm.activity_dedupe';
   const ACTIVITY_DEDUPE_TTL = 2592000;
 
+  /**
+   * Campaign tags Calendly exposes on an invitee's `tracking` object.
+   */
+  const TRACKING_KEYS = [
+    'utm_campaign',
+    'utm_source',
+    'utm_medium',
+    'utm_content',
+    'utm_term',
+  ];
+
   protected $logger;
   protected ConfigFactoryInterface $configFactory;
   protected KeyValueStoreExpirableInterface $activityDedupeStore;
@@ -149,6 +160,14 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
   }
 
   /**
+   * Returns the value only when it is a Calendly resource URI, else ''.
+   */
+  protected static function asResourceUri($value): string {
+    $value = is_string($value) ? trim($value) : '';
+    return str_starts_with($value, 'https://') ? $value : '';
+  }
+
+  /**
    * Builds an idempotency key for activity creation.
    */
   protected function buildActivityDedupeKey(array $data, array $event, string $activityType, string $inviteeEmail, string $start, string $title): string {
@@ -218,6 +237,15 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     if (empty($event['invitee_name']) && !empty($invitee_resource['name'])) {
       $event['invitee_name'] = (string) $invitee_resource['name'];
     }
+    // Attribution rides along with an invitee fetch we were making anyway. We
+    // deliberately do not trigger a fetch just for it — most bookings carry no
+    // campaign, and an extra API call per tour is not worth the tag.
+    if (empty($event['tracking']) && !empty($invitee_resource['tracking']) && is_array($invitee_resource['tracking'])) {
+      $event['tracking'] = $invitee_resource['tracking'];
+    }
+    if (empty($event['questions_and_answers']) && !empty($invitee_resource['questions_and_answers']) && is_array($invitee_resource['questions_and_answers'])) {
+      $event['questions_and_answers'] = $invitee_resource['questions_and_answers'];
+    }
 
     return $event;
   }
@@ -286,8 +314,12 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
    */
   protected function buildActivityDetails(array $data, array $event): string {
     $payload = $data['payload'] ?? [];
-    $event_uri = (string) ($payload['payload']['event'] ?? $payload['event'] ?? '');
-    $invitee_uri = (string) ($payload['payload']['invitee'] ?? $payload['invitee'] ?? '');
+    // On the flat payload shape `$payload['event']` is the webhook event *name*
+    // ("invitee.created"), not a resource URI, so it was being written into the
+    // details as `event_uri: invitee.created`. Keep only real URIs — these
+    // lines are parsed by reporting now.
+    $event_uri = self::asResourceUri($payload['payload']['event'] ?? $payload['event'] ?? '');
+    $invitee_uri = self::asResourceUri($payload['payload']['invitee'] ?? $payload['invitee'] ?? '');
     $created_at = (string) ($payload['created_at'] ?? '');
     $lines = [
       'Calendly metadata',
@@ -297,6 +329,33 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       'source: ' . (!empty($data['backfill']) ? 'backfill' : 'webhook'),
       'resolved_title: ' . ((string) ($event['title'] ?? 'Calendly Event')),
     ];
+
+    // Campaign attribution, one `key: value` line per tag. Kept in this flat
+    // format on purpose: it is what makes "how many tours did the flyer
+    // campaign produce?" answerable straight from SQL against
+    // civicrm_activity.details, with no schema migration.
+    foreach (self::TRACKING_KEYS as $key) {
+      $value = trim((string) ($event['tracking'][$key] ?? ''));
+      if ($value !== '') {
+        $lines[] = $key . ': ' . $value;
+      }
+    }
+
+    // Free text typed by the invitee, so it is escaped — activity details are
+    // rendered as HTML to staff in CiviCRM.
+    foreach (($event['questions_and_answers'] ?? []) as $qa) {
+      if (!is_array($qa)) {
+        continue;
+      }
+      $question = trim((string) ($qa['question'] ?? ''));
+      $answer = trim((string) ($qa['answer'] ?? ''));
+      if ($question === '' || $answer === '') {
+        continue;
+      }
+      $lines[] = 'answer[' . htmlspecialchars($question, ENT_QUOTES, 'UTF-8') . ']: '
+        . htmlspecialchars($answer, ENT_QUOTES, 'UTF-8');
+    }
+
     return implode("\n", $lines);
   }
 

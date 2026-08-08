@@ -12,7 +12,50 @@ optionally linking the organizing staff member as the **source/assignee**.
 - Classifies events as **Tour** or **Orientation** using configurable keyword rules.
 - Finds/creates the invitee in CiviCRM by email; matches staff by organizer email.
 - Creates a CiviCRM Activity with the appropriate type and datetime.
+- Records **campaign attribution** on the activity — see below.
 - Uses Drupal Queue API for resilience and retries.
+
+## Campaign attribution
+
+Calendly copies any `utm_*` params from the booking URL onto the invitee's
+`tracking` object, and stores whatever the booking form asked in
+`questions_and_answers`. Both are written into the activity's **details** field,
+one `key: value` line each:
+
+```
+Calendly metadata
+event_uri: https://api.calendly.com/scheduled_events/...
+invitee_uri: https://api.calendly.com/scheduled_events/.../invitees/...
+created_at: 2026-08-08T12:00:00Z
+source: webhook
+resolved_title: Tuesday Evening Tour with J.R.
+utm_campaign: postcard
+utm_source: landing_page
+utm_medium: website
+answer[How did you hear about us?]: A flyer
+```
+
+The flat `key: value` shape is deliberate: it makes "how many tours did this
+flyer campaign produce?" answerable straight from SQL against
+`civicrm_activity.details`, with no custom field or schema migration. For
+example:
+
+```sql
+SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(a.details, 'utm_campaign: ', -1), '\n', 1) AS campaign,
+       COUNT(*)
+FROM civicrm_activity a
+WHERE a.details LIKE '%utm_campaign: %' AND a.is_deleted = 0
+GROUP BY 1;
+```
+
+**The tag has to reach Calendly first.** That is the job of the two modules
+upstream: `makerspace_landing_page` tags the outbound links with the landing
+page's tracking code, and `calendly_availability` forwards the `utm_*` params
+from the page URL onto the booking URL. If either is missing, `tracking` arrives
+empty and no amount of work here recovers it.
+
+Invitee answers are escaped before storage — activity details render as HTML to
+staff in CiviCRM.
 
 ## Install
 1. Copy this module to `web/modules/custom/calendly_to_civicrm/`.

@@ -18,6 +18,24 @@ class EventParser {
     $start = $payload['payload']['event']['start_time'] ?? $payload['event']['start_time'] ?? $payload['start_time'] ?? NULL;
     $end   = $payload['payload']['event']['end_time'] ?? $payload['event']['end_time'] ?? $payload['end_time'] ?? NULL;
 
+    // Campaign attribution. Calendly copies the utm_* params from the booking
+    // URL onto the invitee's `tracking` object, which is how a tour booked from
+    // a flyer landing page can be told apart from a walk-in. Checked at each of
+    // the payload shapes this module already tolerates.
+    $tracking = $payload['payload']['invitee']['tracking']
+      ?? $payload['payload']['tracking']
+      ?? $payload['invitee']['tracking']
+      ?? $payload['tracking']
+      ?? [];
+
+    // Whatever the event type asks on the booking form ("How did you hear
+    // about us?"), so a walk-in who clicked no tagged link still self-reports.
+    $answers = $payload['payload']['invitee']['questions_and_answers']
+      ?? $payload['payload']['questions_and_answers']
+      ?? $payload['invitee']['questions_and_answers']
+      ?? $payload['questions_and_answers']
+      ?? [];
+
     return [
       'title' => is_string($title) ? $title : 'Calendly Event',
       'invitee_email' => $invitee_email,
@@ -25,6 +43,8 @@ class EventParser {
       'organizer_email' => $organizer_email,
       'start' => $start,
       'end'   => $end,
+      'tracking' => is_array($tracking) ? $tracking : [],
+      'questions_and_answers' => is_array($answers) ? $answers : [],
     ];
   }
 
