@@ -7,6 +7,8 @@ use Drupal\Core\KeyValueStore\KeyValueExpirableFactoryInterface;
 use Drupal\Core\KeyValueStore\KeyValueStoreExpirableInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
 use Drupal\Core\Queue\QueueWorkerBase;
+use Drupal\Core\Queue\RequeueException;
+use Drupal\Core\Queue\SuspendQueueException;
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\RequestException;
 use Symfony\Component\DependencyInjection\ContainerInterface;
@@ -26,6 +28,18 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
   const ACTIVITY_DEDUPE_TTL = 2592000;
 
   /**
+   * Placeholder EventParser falls back to when the payload has no event name.
+   *
+   * It is not a real title: every classification rule misses it, so an activity
+   * carrying it lands under the default type.
+   */
+  const UNRESOLVED_TITLE = 'Calendly Event';
+
+  const UNRESOLVED_ATTEMPT_COLLECTION = 'calendly_to_civicrm.unresolved_attempts';
+  const UNRESOLVED_MAX_ATTEMPTS = 5;
+  const UNRESOLVED_ATTEMPT_TTL = 604800;
+
+  /**
    * Campaign tags Calendly exposes on an invitee's `tracking` object.
    */
   const TRACKING_KEYS = [
@@ -39,6 +53,12 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
   protected $logger;
   protected ConfigFactoryInterface $configFactory;
   protected KeyValueStoreExpirableInterface $activityDedupeStore;
+  /**
+   * Retry counter for bookings Calendly would not resolve, keyed by event.
+   *
+   * @var \Drupal\Core\KeyValueStore\KeyValueStoreExpirableInterface
+   */
+  protected KeyValueStoreExpirableInterface $unresolvedAttemptStore;
   protected Civicrm $civicrm;
   protected ?ClientInterface $httpClient;
 
@@ -47,6 +67,7 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     $this->logger = $logger_factory->get('calendly_to_civicrm');
     $this->configFactory = $config_factory;
     $this->activityDedupeStore = $keyvalue_expirable_factory->get(self::ACTIVITY_DEDUPE_COLLECTION);
+    $this->unresolvedAttemptStore = $keyvalue_expirable_factory->get(self::UNRESOLVED_ATTEMPT_COLLECTION);
     $this->civicrm = $civicrm;
     $this->httpClient = $http_client;
   }
@@ -97,6 +118,20 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     $event = $data['event'] ?? EventParser::parse($data['payload'] ?? []);
     $event = $this->enrichEventFromCalendly($data, $event);
 
+    // Refuse to write a half-resolved booking. With no Calendly token the
+    // webhook payload carries only URIs, so the title stays the placeholder
+    // (every classification rule misses it, and it lands under the default
+    // type) and the start is empty (it used to fall back to date('c'), stamping
+    // the row with the moment the webhook fired rather than when the tour
+    // happened). That combination silently mis-filed 391 activities between
+    // Feb and Jul 2026 and went unnoticed for months, because a wrong row looks
+    // exactly like a right one. A booking we skip can be recovered from the
+    // Calendly API at any time; a booking we corrupt cannot be spotted at all.
+    if ($this->isUnresolvedEvent($event)) {
+      $this->handleUnresolvedEvent($data, $event);
+      return;
+    }
+
     $activityType = EventParser::classifyActivity($rules, $event);
 
     $inviteeEmail = $event['invitee_email'] ?? NULL;
@@ -146,7 +181,10 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
         'source_contact_id' => $staffId ?: $inviteeId,
         'assignee_contact_id' => $staffId ?: NULL,
         'target_contact_id' => $inviteeId,
-        'activity_date_time' => $start ?: date('c'),
+        // Guaranteed non-empty by the isUnresolvedEvent() guard above. It must
+        // never fall back to "now": that is what produced the Feb-Jul 2026 rows
+        // dated when the webhook fired instead of when the booking was for.
+        'activity_date_time' => $start,
         'subject' => $title,
         'details' => $this->buildActivityDetails($data, $event),
       ]);
@@ -157,6 +195,51 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       $this->logger->error('Failed to create activity: @m', ['@m' => $e->getMessage()]);
       throw $e;
     }
+  }
+
+  /**
+   * TRUE when enrichment left the booking without a usable title or start time.
+   */
+  protected function isUnresolvedEvent(array $event): bool {
+    $title = trim((string) ($event['title'] ?? ''));
+    return $title === '' || $title === self::UNRESOLVED_TITLE || empty($event['start']);
+  }
+
+  /**
+   * Decides what to do with a booking that could not be resolved.
+   *
+   * A missing token fails every queued item identically, so the queue is
+   * suspended rather than drained one bad row at a time: the items keep for the
+   * next run and a single loud log says what to fix. A token that is present
+   * but failed on this item is treated as a transient API problem and retried a
+   * bounded number of times before being given up on.
+   */
+  protected function handleUnresolvedEvent(array $data, array $event): void {
+    $payload = $data['payload'] ?? [];
+    $event_uri = self::asResourceUri($payload['payload']['event'] ?? $payload['event'] ?? '');
+    $context = [
+      '@uri' => $event_uri !== '' ? $event_uri : '(none)',
+      '@title' => (string) ($event['title'] ?? ''),
+    ];
+
+    if ($this->resolveCalendlyAccessToken() === '') {
+      $this->logger->critical('No Calendly access token is configured, so bookings cannot be resolved to a real event name or start time. Refusing to create activities that would be filed under the default activity type and dated when the webhook fired. Set the token at /admin/config/services/calendly-availability; queued items are preserved. First unresolved booking: @uri', $context);
+      throw new SuspendQueueException('calendly_to_civicrm: no Calendly access token configured');
+    }
+
+    $key = hash('sha256', $event_uri . '|' . ((string) ($data['dedupe_key'] ?? '')));
+    $attempts = ((int) $this->unresolvedAttemptStore->get($key, 0)) + 1;
+    $this->unresolvedAttemptStore->setWithExpire($key, $attempts, self::UNRESOLVED_ATTEMPT_TTL);
+
+    $context['@n'] = $attempts;
+
+    if ($attempts < self::UNRESOLVED_MAX_ATTEMPTS) {
+      $context['@max'] = self::UNRESOLVED_MAX_ATTEMPTS;
+      $this->logger->warning('Could not resolve Calendly booking @uri (attempt @n of @max); requeueing rather than filing it under the default activity type.', $context);
+      throw new RequeueException('calendly_to_civicrm: unresolved booking, will retry');
+    }
+
+    $this->logger->error('Giving up on Calendly booking @uri after @n attempts; no activity was created. Recover it with a targeted backfill from the module settings form once the API is reachable.', $context);
   }
 
   /**

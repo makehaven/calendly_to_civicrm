@@ -1,0 +1,67 @@
+<?php
+
+/**
+ * @file
+ * Install and runtime requirement checks for calendly_to_civicrm.
+ */
+
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_requirements().
+ *
+ * Surfaces the failure mode that silently mis-filed 391 activities between
+ * February and July 2026: with no Calendly access token the webhook payload
+ * carries only URIs, so bookings cannot be resolved to a real event name or
+ * start time. The queue worker now refuses to write those rather than filing
+ * them under the default activity type dated when the webhook fired -- but a
+ * refusal is only useful if somebody notices, so it is reported here too.
+ */
+function calendly_to_civicrm_requirements($phase) {
+  $requirements = [];
+
+  if ($phase !== 'runtime') {
+    return $requirements;
+  }
+
+  $token = trim((string) \Drupal::config('calendly_availability.settings')
+    ->get('personal_access_token'));
+  $queued = \Drupal::queue('calendly_to_civicrm.queue')->numberOfItems();
+
+  $requirements['calendly_to_civicrm_token'] = [
+    'title' => t('Calendly → CiviCRM'),
+  ];
+
+  if ($token === '') {
+    $requirements['calendly_to_civicrm_token']['severity'] = REQUIREMENT_ERROR;
+    $requirements['calendly_to_civicrm_token']['value'] = t('No access token');
+    $requirements['calendly_to_civicrm_token']['description'] = t(
+      'No Calendly access token is configured, so incoming bookings cannot be resolved to a real event name or start time. Tours and orientations are <strong>not being recorded</strong> — the queue holds @count item(s) and will keep them until a token is set, rather than creating activities with the wrong type and date. Set it on the <a href=":url">Calendly availability settings</a> form.',
+      [
+        '@count' => $queued,
+        ':url' => Url::fromRoute('calendly_availability.settings')->toString(),
+      ]
+    );
+
+    return $requirements;
+  }
+
+  // A token exists, so the only thing worth flagging is a queue that is not
+  // draining — which means the API is refusing us, not that config is missing.
+  if ($queued > 50) {
+    $requirements['calendly_to_civicrm_token']['severity'] = REQUIREMENT_WARNING;
+    $requirements['calendly_to_civicrm_token']['value'] = t('@count queued bookings', ['@count' => $queued]);
+    $requirements['calendly_to_civicrm_token']['description'] = t(
+      'The Calendly queue is not draining. Bookings are held rather than mis-filed, but check the recent log messages for calendly_to_civicrm — the access token may have expired or been revoked.'
+    );
+
+    return $requirements;
+  }
+
+  $requirements['calendly_to_civicrm_token']['severity'] = REQUIREMENT_OK;
+  $requirements['calendly_to_civicrm_token']['value'] = $queued > 0
+    ? t('Token configured, @count queued', ['@count' => $queued])
+    : t('Token configured, queue empty');
+
+  return $requirements;
+}
