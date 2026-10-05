@@ -129,5 +129,53 @@ class EventParserTest extends UnitTestCase {
     $this->assertSame('Meeting', EventParser::classifyActivity($rules, $event));
   }
 
+
+  /**
+   * Calendly's v2 webhook body: names, URIs and times sit under payload.
+   */
+  public function testParsesV2InviteePayload(): void {
+    $payload = [
+      'event' => 'invitee.canceled',
+      'created_at' => '2026-10-05T18:06:50.000000Z',
+      'payload' => [
+        'email' => 'visitor@example.org',
+        'name' => 'Vi Sitor',
+        'first_name' => 'Vi',
+        'last_name' => 'Sitor',
+        'uri' => 'https://api.calendly.com/scheduled_events/EV1/invitees/INV1',
+        'event' => 'https://api.calendly.com/scheduled_events/EV1',
+        'rescheduled' => TRUE,
+        'cancellation' => ['canceler_type' => 'invitee'],
+        'scheduled_event' => [
+          'uri' => 'https://api.calendly.com/scheduled_events/EV1',
+          'name' => 'Afternoon Tour with Lior',
+          'start_time' => '2026-10-06T19:00:00.000000Z',
+          'end_time' => '2026-10-06T19:30:00.000000Z',
+          'event_memberships' => [['user_email' => 'lior@example.org']],
+        ],
+      ],
+    ];
+    $e = EventParser::parse($payload);
+    $this->assertSame('invitee.canceled', $e['webhook']);
+    $this->assertSame('Afternoon Tour with Lior', $e['title']);
+    $this->assertSame('visitor@example.org', $e['invitee_email']);
+    $this->assertSame('Vi Sitor', $e['invitee_name']);
+    $this->assertSame('lior@example.org', $e['organizer_email']);
+    $this->assertSame('2026-10-06T19:00:00.000000Z', $e['start']);
+    $this->assertSame('https://api.calendly.com/scheduled_events/EV1', $e['event_uri']);
+    $this->assertSame('https://api.calendly.com/scheduled_events/EV1/invitees/INV1', $e['invitee_uri']);
+    $this->assertTrue($e['rescheduled']);
+    $this->assertSame('invitee', $e['canceler_type']);
+  }
+
+  /**
+   * A URI in the event slot is not a webhook name.
+   */
+  public function testWebhookNameOnlyFromTopLevelString(): void {
+    $this->assertSame('', EventParser::parse(['event' => 'https://api.calendly.com/scheduled_events/X'])['webhook']);
+    $this->assertSame('', EventParser::parse(['event' => ['name' => 'Tour']])['webhook']);
+    $this->assertSame('invitee.created', EventParser::parse(['event' => 'invitee.created'])['webhook']);
+  }
+
 }
 

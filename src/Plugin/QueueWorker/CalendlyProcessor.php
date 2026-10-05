@@ -12,8 +12,11 @@ use Drupal\Core\Queue\SuspendQueueException;
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\RequestException;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\calendly_to_civicrm\Event\CalendlyBookingEvent;
 use Drupal\calendly_to_civicrm\EventParser;
 use Drupal\civicrm\Civicrm;
+use Civi\Api4\Activity;
+use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 
 /**
  * @QueueWorker(
@@ -61,8 +64,19 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
   protected KeyValueStoreExpirableInterface $unresolvedAttemptStore;
   protected Civicrm $civicrm;
   protected ?ClientInterface $httpClient;
+  /**
+   * Announces bookings and cancellations to other modules (door passes).
+   *
+   * @var \Symfony\Contracts\EventDispatcher\EventDispatcherInterface|null
+   */
+  protected ?EventDispatcherInterface $dispatcher;
 
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, Civicrm $civicrm, ?ClientInterface $http_client = NULL) {
+  /**
+   * CiviCRM activity status recorded on a booking that was cancelled.
+   */
+  const STATUS_CANCELLED = 'Cancelled';
+
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, Civicrm $civicrm, ?ClientInterface $http_client = NULL, ?EventDispatcherInterface $dispatcher = NULL) {
     parent::__construct($configuration, $plugin_id, $plugin_definition);
     $this->logger = $logger_factory->get('calendly_to_civicrm');
     $this->configFactory = $config_factory;
@@ -70,6 +84,7 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     $this->unresolvedAttemptStore = $keyvalue_expirable_factory->get(self::UNRESOLVED_ATTEMPT_COLLECTION);
     $this->civicrm = $civicrm;
     $this->httpClient = $http_client;
+    $this->dispatcher = $dispatcher;
   }
 
   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
@@ -81,7 +96,8 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       $container->get('config.factory'),
       $container->get('keyvalue.expirable'),
       $container->get('civicrm'),
-      $container->get('http_client')
+      $container->get('http_client'),
+      $container->get('event_dispatcher')
     );
   }
 
@@ -115,7 +131,23 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       }
     }
 
-    $event = $data['event'] ?? EventParser::parse($data['payload'] ?? []);
+    // Items queued before 2026-10 lack the webhook name and URIs; the
+    // payload is re-read to fill only what the queued event is missing.
+    $event = ($data['event'] ?? []) + EventParser::parse($data['payload'] ?? []);
+
+    // A cancellation is not a new booking. Until 2026-10 it went down the
+    // create path: the original activity stayed in place as if the tour
+    // happened, and sometimes a second one was added (its created_at differed,
+    // so the dedupe key missed it). That made tour counts about 1 in 5 too high.
+    if (($event['webhook'] ?? '') === EventParser::INVITEE_CANCELED) {
+      $this->handleCancellation($data, $event);
+      return;
+    }
+    if (!in_array($event['webhook'] ?? '', ['', EventParser::INVITEE_CREATED], TRUE)) {
+      $this->logger->notice('Ignoring Calendly webhook @name.', ['@name' => $event['webhook']]);
+      return;
+    }
+
     $event = $this->enrichEventFromCalendly($data, $event);
 
     // Refuse to write a half-resolved booking. With no Calendly token the
@@ -168,6 +200,11 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       }
     }
 
+    // Other modules act on the booking too (door passes). They must not be
+    // able to stop the activity being written, and a requeue re-dispatches,
+    // so listeners are idempotent.
+    $this->dispatchBooking(CalendlyBookingEvent::CREATED, $data, $event, (string) $inviteeEmail, $inviteeId);
+
     $activityDedupeKey = $this->buildActivityDedupeKey($data, $event, $activityType, (string) $inviteeEmail, (string) $start, (string) $title);
     if (!$this->activityDedupeStore->setWithExpireIfNotExists($activityDedupeKey, time(), self::ACTIVITY_DEDUPE_TTL)) {
       $this->logger->notice('Skipping duplicate Calendly activity for dedupe key @key.', ['@key' => $activityDedupeKey]);
@@ -194,6 +231,94 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
       $this->activityDedupeStore->delete($activityDedupeKey);
       $this->logger->error('Failed to create activity: @m', ['@m' => $e->getMessage()]);
       throw $e;
+    }
+  }
+
+  /**
+   * Records a cancelled booking: marks its activities Cancelled, never adds one.
+   *
+   * The booking's activities are found by the scheduled-event URI in their
+   * details plus the invitee as target contact. Matching on the invitee URI
+   * alone would miss every row written before 2026-10, which all say
+   * "invitee_uri: (none)". A rescheduled booking arrives as this cancellation
+   * plus a new invitee.created, which records the new time.
+   */
+  protected function handleCancellation(array $data, array $event): void {
+    $email = trim((string) ($event['invitee_email'] ?? ''));
+    $eventUri = (string) ($event['event_uri'] ?? '');
+    if ($email === '' || $eventUri === '') {
+      $this->logger->warning('Calendly cancellation without an email or event URI; nothing marked cancelled. Invitee @uri', [
+        '@uri' => ($event['invitee_uri'] ?? '') ?: '(none)',
+      ]);
+      return;
+    }
+
+    $contactId = $this->civiFindContactByEmail($email);
+    $this->dispatchBooking(CalendlyBookingEvent::CANCELED, $data, $event, $email, $contactId);
+    if (!$contactId) {
+      $this->logger->notice('Calendly cancellation for @email: no CiviCRM contact, so no activity to mark cancelled.', ['@email' => $email]);
+      return;
+    }
+
+    $ids = $this->civiFindBookingActivities($eventUri, $contactId);
+    if (!$ids) {
+      $this->logger->notice('Calendly cancellation for @email on @uri: no recorded activity to mark cancelled.', [
+        '@email' => $email,
+        '@uri' => $eventUri,
+      ]);
+      return;
+    }
+    $note = sprintf(
+      'cancelled: %s by %s%s',
+      (string) (($data['payload']['created_at'] ?? '') ?: date('c')),
+      ($event['canceler_type'] ?? '') ?: 'unknown',
+      !empty($event['rescheduled']) ? ' (rescheduled)' : ''
+    );
+    foreach ($ids as $id) {
+      $this->civiMarkActivityCancelled($id, $note);
+    }
+    $this->logger->notice('Marked @n Calendly activit(ies) cancelled for @email (@ids).', [
+      '@n' => count($ids),
+      '@email' => $email,
+      '@ids' => implode(', ', $ids),
+    ]);
+  }
+
+  /**
+   * Tells listeners (door passes) about a booking or cancellation.
+   */
+  protected function dispatchBooking(string $name, array $data, array $event, string $email, ?int $contactId): void {
+    if (!$this->dispatcher || !empty($data['backfill'])) {
+      return;
+    }
+    $ref = ($event['invitee_uri'] ?? '') ?: ((($event['event_uri'] ?? '') !== '' && $email !== '') ? $event['event_uri'] . '#' . strtolower($email) : '');
+    if ($ref === '') {
+      return;
+    }
+    $booking = [
+      'ref' => $ref,
+      'event_uri' => (string) ($event['event_uri'] ?? ''),
+      'invitee_uri' => (string) ($event['invitee_uri'] ?? ''),
+      'title' => (string) ($event['title'] ?? ''),
+      'start' => (string) ($event['start'] ?? ''),
+      'end' => (string) ($event['end'] ?? ''),
+      'email' => $email,
+      'name' => (string) ($event['invitee_name'] ?? ''),
+      'first_name' => (string) ($event['first_name'] ?? ''),
+      'last_name' => (string) ($event['last_name'] ?? ''),
+      'contact_id' => (int) $contactId,
+      'rescheduled' => !empty($event['rescheduled']),
+      'canceler_type' => (string) ($event['canceler_type'] ?? ''),
+    ];
+    try {
+      $this->dispatcher->dispatch(new CalendlyBookingEvent($booking), $name);
+    }
+    catch (\Throwable $e) {
+      $this->logger->error('A listener failed on @name for @ref: @m', [
+        '@name' => $name,
+        '@ref' => $ref,
+        '@m' => $e->getMessage(),
+      ]);
     }
   }
 
@@ -402,7 +527,7 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     // details as `event_uri: invitee.created`. Keep only real URIs — these
     // lines are parsed by reporting now.
     $event_uri = self::asResourceUri($payload['payload']['event'] ?? $payload['event'] ?? '');
-    $invitee_uri = self::asResourceUri($payload['payload']['invitee'] ?? $payload['invitee'] ?? '');
+    $invitee_uri = ($event['invitee_uri'] ?? '') ?: self::asResourceUri($payload['payload']['invitee'] ?? $payload['invitee'] ?? '');
     $created_at = (string) ($payload['created_at'] ?? '');
     $lines = [
       'Calendly metadata',
@@ -483,6 +608,44 @@ class CalendlyProcessor extends QueueWorkerBase implements ContainerFactoryPlugi
     }
     $r = civicrm_api3('Contact', 'create', $params);
     return (int) $r['id'];
+  }
+
+  /**
+   * Live Calendly activities for one booking: scheduled event + invitee.
+   *
+   * @return int[]
+   *   Activity ids not already cancelled or deleted.
+   */
+  protected function civiFindBookingActivities(string $eventUri, int $contactId): array {
+    $this->civicrmBoot();
+    $rows = Activity::get(FALSE)
+      ->addSelect('id')
+      ->addJoin('ActivityContact AS ac', 'INNER', ['ac.activity_id', '=', 'id'])
+      ->addWhere('ac.contact_id', '=', $contactId)
+      ->addWhere('ac.record_type_id:name', '=', 'Activity Targets')
+      ->addWhere('details', 'LIKE', 'Calendly metadata%')
+      ->addWhere('details', 'LIKE', '%event_uri: ' . $eventUri . '%')
+      ->addWhere('status_id:name', '!=', self::STATUS_CANCELLED)
+      ->addWhere('is_deleted', '=', FALSE)
+      ->execute();
+    return array_values(array_unique(array_map('intval', $rows->column('id'))));
+  }
+
+  /**
+   * Sets an activity's status to Cancelled and notes why in its details.
+   */
+  protected function civiMarkActivityCancelled(int $activityId, string $note): void {
+    $this->civicrmBoot();
+    $current = Activity::get(FALSE)
+      ->addSelect('details')
+      ->addWhere('id', '=', $activityId)
+      ->execute()
+      ->first();
+    Activity::update(FALSE)
+      ->addWhere('id', '=', $activityId)
+      ->addValue('status_id:name', self::STATUS_CANCELLED)
+      ->addValue('details', rtrim((string) ($current['details'] ?? '')) . "\n" . $note)
+      ->execute();
   }
 
   protected function civiCreateActivity(array $params): int {

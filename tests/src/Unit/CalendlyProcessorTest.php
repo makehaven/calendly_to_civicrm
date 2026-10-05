@@ -11,7 +11,9 @@ use Drupal\Core\Logger\LoggerChannelInterface;
 use Drupal\Core\Queue\RequeueException;
 use Drupal\Core\Queue\SuspendQueueException;
 use Drupal\Tests\UnitTestCase;
+use Drupal\calendly_to_civicrm\Event\CalendlyBookingEvent;
 use Drupal\calendly_to_civicrm\Plugin\QueueWorker\CalendlyProcessor;
+use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use Drupal\civicrm\Civicrm;
 
 /**
@@ -154,6 +156,73 @@ class CalendlyProcessorTest extends UnitTestCase {
   }
 
   /**
+   * A cancellation marks the booking's activities; it never adds one.
+   *
+   * @covers ::processItem
+   */
+  public function testCancellationMarksActivitiesCancelledAndCreatesNone(): void {
+    $store = $this->createMock(KeyValueStoreExpirableInterface::class);
+    $store->expects($this->never())->method('setWithExpireIfNotExists');
+    $worker = $this->buildWorker($store, FALSE);
+    $worker->bookingActivities = [501, 502];
+
+    $data = $this->buildData();
+    $data['payload']['event'] = 'invitee.canceled';
+    $data['payload']['created_at'] = '2026-10-05T12:00:00Z';
+    $data['payload']['payload']['rescheduled'] = TRUE;
+    $data['payload']['payload']['cancellation'] = ['canceler_type' => 'host'];
+    unset($data['event']['webhook']);
+    $worker->processItem($data);
+
+    $this->assertSame(0, $worker->createdActivities);
+    $this->assertSame([501, 502], array_keys($worker->cancelled));
+    $this->assertSame('cancelled: 2026-10-05T12:00:00Z by host (rescheduled)', $worker->cancelled[501]);
+    $this->assertSame(['https://api.calendly.com/scheduled_events/AAA', 101], $worker->lookedUp);
+    $this->assertSame(CalendlyBookingEvent::CANCELED, $worker->dispatched[0][0]);
+    $this->assertSame('https://api.calendly.com/scheduled_events/AAA/invitees/BBB', $worker->dispatched[0][1]['ref']);
+  }
+
+  /**
+   * A booking is announced to listeners (door passes) with its times.
+   *
+   * @covers ::processItem
+   */
+  public function testCreatedBookingIsDispatched(): void {
+    $store = $this->createMock(KeyValueStoreExpirableInterface::class);
+    $store->method('setWithExpireIfNotExists')->willReturn(TRUE);
+    $worker = $this->buildWorker($store, FALSE);
+
+    $data = $this->buildData();
+    $data['payload']['event'] = 'invitee.created';
+    $worker->processItem($data);
+
+    $this->assertSame(1, $worker->createdActivities);
+    $this->assertCount(1, $worker->dispatched);
+    [$name, $booking] = $worker->dispatched[0];
+    $this->assertSame(CalendlyBookingEvent::CREATED, $name);
+    $this->assertSame('Tour Session', $booking['title']);
+    $this->assertSame('2026-02-13T12:00:00Z', $booking['start']);
+    $this->assertSame('invitee@example.org', $booking['email']);
+    $this->assertSame(202, $booking['contact_id']);
+    $this->assertStringContainsString('invitee_uri: https://api.calendly.com/scheduled_events/AAA/invitees/BBB', $worker->lastParams['details']);
+  }
+
+  /**
+   * Webhooks other than invitee.created/canceled are ignored.
+   *
+   * @covers ::processItem
+   */
+  public function testOtherWebhooksAreIgnored(): void {
+    $store = $this->createMock(KeyValueStoreExpirableInterface::class);
+    $worker = $this->buildWorker($store, FALSE);
+    $data = $this->buildData();
+    $data['payload']['event'] = 'routing_form_submission.created';
+    $worker->processItem($data);
+    $this->assertSame(0, $worker->createdActivities);
+    $this->assertSame([], $worker->dispatched);
+  }
+
+  /**
    * Builds a queue item shaped the way it arrives when enrichment cannot run.
    *
    * URIs only, so the placeholder title survives and there is no start time.
@@ -254,8 +323,64 @@ class TestableCalendlyProcessor extends CalendlyProcessor {
   private bool $throwOnCreate;
 
   public function __construct(array $configuration, $plugin_id, $plugin_definition, $logger_factory, ConfigFactoryInterface $config_factory, KeyValueExpirableFactoryInterface $keyvalue_expirable_factory, Civicrm $civicrm, bool $throw_on_create) {
-    parent::__construct($configuration, $plugin_id, $plugin_definition, $logger_factory, $config_factory, $keyvalue_expirable_factory, $civicrm);
+    $recorder = new class($this) implements EventDispatcherInterface {
+
+      public function __construct(private TestableCalendlyProcessor $worker) {}
+
+      /**
+       * {@inheritdoc}
+       */
+      public function dispatch(object $event, ?string $eventName = NULL): object {
+        $this->worker->dispatched[] = [$eventName, $event->getBooking()];
+        return $event;
+      }
+
+    };
+    parent::__construct($configuration, $plugin_id, $plugin_definition, $logger_factory, $config_factory, $keyvalue_expirable_factory, $civicrm, NULL, $recorder);
     $this->throwOnCreate = $throw_on_create;
+  }
+
+  /**
+   * Booking events handed to the dispatcher: [name, booking].
+   *
+   * @var array
+   */
+  public array $dispatched = [];
+
+  /**
+   * Activity ids civiFindBookingActivities() returns.
+   *
+   * @var int[]
+   */
+  public array $bookingActivities = [];
+
+  /**
+   * Arguments of the last civiFindBookingActivities() call.
+   *
+   * @var array
+   */
+  public array $lookedUp = [];
+
+  /**
+   * Activities marked cancelled: id => note.
+   *
+   * @var array
+   */
+  public array $cancelled = [];
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function civiFindBookingActivities(string $eventUri, int $contactId): array {
+    $this->lookedUp = [$eventUri, $contactId];
+    return $this->bookingActivities;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function civiMarkActivityCancelled(int $activityId, string $note): void {
+    $this->cancelled[$activityId] = $note;
   }
 
   protected function civicrmBoot() {}
